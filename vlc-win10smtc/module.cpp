@@ -72,7 +72,10 @@ struct intf_sys_t
         input{ nullptr },
         advertise{ false },
         metadata_advertised{ false },
+        last_advertised_position{ -1 },
+        last_advertised_position_timestamp{ -1 },
         position{ -1 },
+        position_timestamp{ -1 },
         length{ -1 }
     {
         timeLine.StartTime(TimeSpan::zero());
@@ -284,6 +287,7 @@ struct intf_sys_t
     input_state_e input_state;
     bool seekable;
     int64_t position;
+    mtime_t position_timestamp;
     int64_t length;
     vlc_thread_t thread;
     vlc_mutex_t lock;
@@ -291,8 +295,9 @@ struct intf_sys_t
 
     bool advertise;
     bool metadata_advertised; // was the last song advertised to Windows?
+    int64_t last_advertised_position;
+    mtime_t last_advertised_position_timestamp;
 };
-
 
 int InputEvent(vlc_object_t* object, char const* cmd,
     vlc_value_t oldval, vlc_value_t newval, void* data)
@@ -319,7 +324,18 @@ int InputEvent(vlc_object_t* object, char const* cmd,
         } else if (newval.i_int == INPUT_EVENT_LENGTH) {
             sys->length = var_GetInteger(input, "length");
         } else if (newval.i_int == INPUT_EVENT_POSITION) {
+            sys->position_timestamp = mdate();
             sys->position = var_GetInteger(input, "time");
+            sys->advertise = true;
+            if (sys->last_advertised_position != -1
+                && sys->last_advertised_position_timestamp != -1) {
+                auto delta = sys->position_timestamp - sys->last_advertised_position_timestamp;
+                auto previous = sys->last_advertised_position + delta;
+                constexpr int64_t allowed_error_usec = 1000;
+                if (abs(sys->position - previous) < allowed_error_usec) {
+                    sys->advertise = false; // within margin of error
+                }
+            }
         }
 
         vlc_cond_signal(&sys->wait);
@@ -386,7 +402,10 @@ void* Thread(void* handle)
 
         if (sys->input_state >= PLAYING_S && sys->position != -1) {
             sys->AdvertisePosition();
+            sys->last_advertised_position = sys->position;
+            sys->last_advertised_position_timestamp = sys->position_timestamp;
             sys->position = -1;
+            sys->position_timestamp = -1;
         }
 
         vlc_restorecancel(canc);
