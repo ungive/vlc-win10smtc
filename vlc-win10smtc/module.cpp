@@ -7,6 +7,7 @@
 #include <vlc_interface.h>
 #include <vlc_playlist.h>
 #include <vlc_input.h>
+#include <vlc_url.h>
 #include <libvlc.h>
 
 #include <winrt/Windows.Foundation.h>
@@ -14,10 +15,7 @@
 #include <winrt/Windows.Media.Playback.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.Storage.Streams.h>
-#include <regex>
-#include <shlwapi.h>
 
-#pragma comment(lib, "Shlwapi.lib")
 #define DEFAULT_THUMBNAIL_URI L"https://upload.wikimedia.org/wikipedia/commons/3/38/VLC_icon.png"
 
 void DebugOut(wchar_t* fmt, ...)
@@ -37,6 +35,29 @@ using namespace std::chrono;
 using namespace std;
 
 using pts = duration<long long, ratio<1, 1000000>>;
+
+template <typename T>
+struct VLCMemory
+{
+    VLCMemory(T* buf)
+        : m_buf(buf)
+    { }
+
+    ~VLCMemory() {
+        if (m_buf) {
+            libvlc_free(m_buf);
+        }
+    }
+
+    VLCMemory(const VLCMemory&) = delete;
+    VLCMemory& operator=(const VLCMemory&) = delete;
+
+    operator T* () const {
+        return m_buf;
+    }
+
+    T* const m_buf;
+};
 
 struct intf_sys_t
 {
@@ -178,9 +199,8 @@ struct intf_sys_t
             return;
 
         input_item_t* item = input_GetItem(input);
-        winrt::hstring title, artist, album, thumburi, path;
-        char pathbuff[MAX_PATH];
-        std::string pathstr;
+        winrt::hstring title, artist, album;
+        std::optional<winrt::Windows::Storage::Streams::RandomAccessStreamReference> thumbnail;
 
         auto to_hstring = [](char* buf, winrt::hstring def) {
             winrt::hstring ret;
@@ -189,12 +209,13 @@ struct intf_sys_t
                 ret = winrt::to_hstring(buf);
                 libvlc_free(buf);
             }
-            else {
+
+            if (ret.empty()) {
                 ret = def;
             }
 
             return ret;
-            };
+        };
 
         title = to_hstring(input_item_GetTitleFbName(item), L"Unknown Title");
         artist = to_hstring(input_item_GetArtist(item), L"Unknown Artist");
@@ -203,40 +224,29 @@ struct intf_sys_t
         Disp().MusicProperties().Title(title);
         Disp().MusicProperties().Artist(artist);
         Disp().MusicProperties().AlbumTitle(album);
-
-        // TODO: use artwork provided by ID3tag (if exists)
-        //input_attachment_t* p_attachment = input_GetAttachment(p_input, name);
-        thumburi = to_hstring(input_item_GetArtworkURL(item), L"");
-        int pathlen = 0;
-        unsigned long pathlen2 = ARRAYSIZE(pathbuff);
         
-        if (thumburi == L"") { 
-            thumburi = DEFAULT_THUMBNAIL_URI; 
-            winrt::Windows::Foundation::Uri uri{ thumburi };
-            winrt::Windows::Storage::Streams::RandomAccessStreamReference thumbnail = winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromUri(uri);
-            Disp().Thumbnail(thumbnail);
+        try {
+            if (VLCMemory<char> artworkUrl{ input_item_GetArtworkURL(item) }) {
+                DebugOut(L"SMTC ArtworkURL: %S", artworkUrl.m_buf);
+
+                if (strnicmp(artworkUrl, "http", 4) == 0) {
+                    winrt::Windows::Foundation::Uri uri{ winrt::to_hstring(artworkUrl.m_buf) };
+                    thumbnail = winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromUri(uri);
+                }
+                else if (VLCMemory<char> artworkLocalPath{ vlc_uri2path(artworkUrl) }) {
+                    auto file = winrt::Windows::Storage::StorageFile::GetFileFromPathAsync(winrt::to_hstring(artworkLocalPath.m_buf)).get();
+                    thumbnail = winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromFile(file);
+                }
+            }
         }
-        else {
-            winrt::Windows::Foundation::Uri uri{ thumburi };
-            PathCreateFromUrlA(winrt::to_string(thumburi).c_str(), pathbuff, &pathlen2, NULL);
-            std::string str(pathbuff, pathlen2);
-
-            path = winrt::to_hstring(str);
-            pathlen = path.size();
-
-            // Uncomment to test crashes, and use Casterlabs Caffinated WMC tool to check outputs
-            //thumburi = DEFAULT_THUMBNAIL_URI;
-            //uri = winrt::Windows::Foundation::Uri::Uri(thumburi);
-            //winrt::Windows::Storage::Streams::RandomAccessStreamReference thumbnail = winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromUri(uri);
-            //Disp().MusicProperties().AlbumArtist(path + winrt::to_hstring(pathlen)); // set this to check the path being used
-            
-            // Comment when testing with above
-            winrt::Windows::Storage::Streams::IRandomAccessStream storagefile = winrt::Windows::Storage::Streams::FileRandomAccessStream::OpenAsync(path, winrt::Windows::Storage::FileAccessMode::Read).get();
-            winrt::Windows::Storage::Streams::RandomAccessStreamReference thumbnail = winrt::Windows::Storage::Streams::RandomAccessStreamReference::CreateFromStream(storagefile);
-            
-            Disp().Thumbnail(thumbnail);
+        catch (const winrt::hresult_error& ex) {
+            DebugOut(L"SMTC thumbnail exception: %s code: 0x%X", ex.message().c_str(), ex.code().value);
+        }
+        catch (...) {
+            DebugOut(L"SMTC thumbnail unknown exception. hres: 0x%X, GetLastError: %d", winrt::to_hresult().value, GetLastError());
         }
 
+        Disp().Thumbnail(thumbnail.value_or(defaultArt));
         Disp().Update();
     }
 
